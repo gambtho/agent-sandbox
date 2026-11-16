@@ -28,6 +28,8 @@ SANDBOX_PLURAL_NAME = "sandboxes"
 CLIENT_REQUEST_TIME_ANNOTATION = "agents.x-k8s.io/client-first-requested-at"
 # Deprecated: New Sandboxes use their own name for the backing pod while non-empty legacy annotations may still be honored.
 POD_NAME_ANNOTATION = "agents.x-k8s.io/pod-name"
+# Set on a SandboxClaim to name the Sandbox it was assigned (possibly a warm pool's).
+SANDBOX_NAME_ANNOTATION = "agents.x-k8s.io/sandbox-name"
 CREATED_BY_LABEL = "agents.x-k8s.io/created-by"
 PODSNAPSHOT_POD_NAME_ANNOTATION = "podsnapshot.gke.io/origin-pod"
 PODSNAPSHOT_NAME_ANNOTATION = "podsnapshot.gke.io/ps-name"

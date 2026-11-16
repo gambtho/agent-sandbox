@@ -23,6 +23,7 @@ from .async_connector import AsyncSandboxConnector
 from .async_k8s_helper import AsyncK8sHelper
 from .commands.async_command_executor import AsyncCommandExecutor
 from .constants import POD_NAME_ANNOTATION
+from .deletion_wait import PendingDeletion, validate_wait_timeout
 from .exceptions import SandboxError, SandboxNotFoundError
 from .files.async_filesystem import AsyncFilesystem
 from .models import (
@@ -106,6 +107,8 @@ class AsyncSandbox:
         self._is_closed = False
         self._pod_name: str | None = None
         self._sandbox_name_hash: str | None = None
+        # Names a timed-out terminate(wait=True) keeps checking when it is retried.
+        self._pending_deletion: PendingDeletion | None = None
 
     async def suspend(self, *, timeout: int = 180) -> None:
         """Suspend the Sandbox and wait for the controller to report `Suspended`.
@@ -346,7 +349,7 @@ class AsyncSandbox:
         self._watcher = None
         self._is_closed = True
 
-    async def terminate(self) -> None:
+    async def terminate(self, *, wait: bool = False, timeout: float = 180) -> None:
         """
         Permanent deletion of all server side infrastructure and client side connection.
 
@@ -354,14 +357,42 @@ class AsyncSandbox:
         cleared so later calls are a local no-op and do not issue another DELETE.
         If the claim is already gone remotely, ``delete_sandbox_claim`` treats a
         404 as success rather than raising.
+
+        With ``wait=True`` the claim is deleted with foreground propagation and
+        this call returns once the claim, this handle's Sandbox and the Pod names
+        known for that Sandbox are all absent in one polling pass, or raises
+        ``TimeoutError`` after ``timeout`` seconds (a finite number above 0). On
+        timeout or cancellation any deletion already in progress is left alone.
+        The budget can expire during reads before deletion is requested. The
+        handle stays registered and keeps the names found, so
+        ``terminate(wait=True)`` can retry. A plain ``terminate()``
+        afterwards only requests the delete.
+
+        The wait covers only objects known when it looks, not ones a controller
+        creates later. A Pod gone from the API does not prove its processes have
+        stopped on a node that cannot be reached. It needs ``get`` on
+        SandboxClaims, Sandboxes and Pods.
         """
+        if wait:
+            # Reject a bad timeout before closing the connection or touching anything.
+            timeout = validate_wait_timeout(timeout)
+        pod_name = self._pod_name
+
         await self.close_connection()
 
         if not self.claim_name:
             # Already deleted (or never successfully created a claim).
             return
 
-        await self.k8s_helper.delete_sandbox_claim(self.claim_name, self.namespace)
+        if wait:
+            if self._pending_deletion is None:
+                self._pending_deletion = PendingDeletion.for_handle(self.claim_name, self.sandbox_id, pod_name)
+            await self.k8s_helper.delete_sandbox_claim_and_wait(
+                self.claim_name, self.namespace, timeout, self._pending_deletion,
+            )
+        else:
+            await self.k8s_helper.delete_sandbox_claim(self.claim_name, self.namespace)
+        self._pending_deletion = None
 
         # The client stops tracking the handle here because its claim is gone. Call
         # _on_terminated before clearing claim_name, because that name is the client's key.

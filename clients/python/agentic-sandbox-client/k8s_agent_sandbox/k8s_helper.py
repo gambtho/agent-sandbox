@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import logging
 import math
 import time
 from itertools import chain
 from datetime import UTC, datetime
-from typing import Any, List, cast
+from typing import Any, Callable, List, cast
 from kubernetes import client, config, watch
 import urllib3.exceptions
+from . import deletion_wait
+from .deletion_wait import DeadlineExceeded, PendingDeletion
 from .exceptions import SandboxClaimFailedError, SandboxMetadataError, SandboxNotFoundError, SandboxTemplateNotFoundError, SandboxWarmPoolNotFoundError
 from .models import AdditionalPodMetadata
 from .utils import (
@@ -406,6 +409,103 @@ class K8sHelper:
             if e.status != 404:
                 logger.error(f"Error terminating SandboxClaim {name}: {e}")
                 raise
+
+    def _retry_free_api_client(self) -> client.ApiClient:
+        """Return a short-lived client over a copy of the active client's configuration with
+        every transport retry off, so one request cannot outlast its ``_request_timeout``.
+        The caller's client and configuration are left untouched; close the result.
+        """
+        source = self.custom_objects_api.api_client
+        config = copy.copy(source.configuration)
+        config.retries = False
+        config.client_go_retries = False
+        api_client = client.ApiClient(config, cookie=source.cookie)
+        api_client.default_headers = dict(source.default_headers)
+        return api_client
+
+    def delete_sandbox_claim_and_wait(
+        self, name: str, namespace: str, timeout: float, pending: PendingDeletion,
+    ) -> None:
+        """Foreground-delete a SandboxClaim, then poll until the claim and every Sandbox and Pod
+        name in ``pending`` are absent in one pass.
+
+        All requests share one monotonic budget of ``timeout`` seconds and go through a retry-free
+        client. ``pending`` gains every name learned along the way; keep it for a retry. Raises
+        ``TimeoutError`` when the budget runs out and lets non-404 API errors propagate. Reading
+        needs ``get`` on SandboxClaims, Sandboxes and Pods.
+        """
+        deadline = time.monotonic() + timeout
+        present: list[str] = []
+        unverified: str | None = None
+        delete_sent = False
+
+        def call(label: str, func: Callable[..., Any], *, deleting: bool = False, **kwargs: Any) -> Any:
+            nonlocal unverified, delete_sent
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeadlineExceeded()
+            unverified = label
+            if deleting:
+                delete_sent = True
+            try:
+                result = func(_request_timeout=remaining, **kwargs)
+            except urllib3.exceptions.NewConnectionError:
+                # Refused connections and DNS failures also inherit TimeoutError.
+                raise
+            except urllib3.exceptions.TimeoutError:
+                raise DeadlineExceeded() from None
+            except client.ApiException as e:
+                if e.status != 404:
+                    raise
+                result = None
+            unverified = None
+            return result
+
+        api_client = self._retry_free_api_client()
+        custom_objects, core_v1 = client.CustomObjectsApi(api_client), client.CoreV1Api(api_client)
+
+        def observe() -> list[str]:
+            found: list[str] = []
+            label = f"SandboxClaim '{pending.claim_name}'"
+            claim = call(label, custom_objects.get_namespaced_custom_object, group=CLAIM_API_GROUP,
+                         version=CLAIM_API_VERSION, namespace=namespace, plural=CLAIM_PLURAL_NAME,
+                         name=pending.claim_name)
+            if claim is not None:
+                found.append(label)
+                pending.learn_claim(claim)
+            for sandbox_name in sorted(pending.sandboxes):
+                label = f"Sandbox '{sandbox_name}'"
+                sandbox = call(label, custom_objects.get_namespaced_custom_object, group=SANDBOX_API_GROUP,
+                               version=SANDBOX_API_VERSION, namespace=namespace, plural=SANDBOX_PLURAL_NAME,
+                               name=sandbox_name)
+                if sandbox is not None:
+                    found.append(label)
+                    pending.learn_sandbox(sandbox_name, sandbox)
+            for pod_name in sorted(pending.pods):
+                label = f"Pod '{pod_name}'"
+                if call(label, core_v1.read_namespaced_pod, name=pod_name, namespace=namespace) is not None:
+                    found.append(label)
+            return found
+
+        try:
+            # Learn names while the claim and Sandbox still exist, before deleting anything.
+            present = observe()
+            call(f"deletion of SandboxClaim '{name}'", custom_objects.delete_namespaced_custom_object,
+                 deleting=True, group=CLAIM_API_GROUP, version=CLAIM_API_VERSION, namespace=namespace,
+                 plural=CLAIM_PLURAL_NAME, name=name, propagation_policy="Foreground")
+            logger.info(f"Requested foreground deletion of SandboxClaim: {name}")
+            while True:
+                present = observe()
+                if not present:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DeadlineExceeded()
+                time.sleep(min(deletion_wait.POLL_INTERVAL_SECONDS, remaining))
+        except DeadlineExceeded:
+            raise pending.timeout_error(timeout, present, unverified, delete_sent) from None
+        finally:
+            api_client.close()
 
     def patch_sandbox_operating_mode(
         self, name: str, namespace: str, mode: str, uid: str,

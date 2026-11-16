@@ -1764,3 +1764,43 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSandboxWithSnapshotSupportTerminate(unittest.TestCase):
+    @patch("k8s_agent_sandbox.sandbox.SandboxConnector")
+    @patch("k8s_agent_sandbox.sandbox.create_tracer_manager")
+    @patch("k8s_agent_sandbox.sandbox.CommandExecutor")
+    @patch("k8s_agent_sandbox.sandbox.Filesystem")
+    def setUp(self, mock_fs, mock_ce, mock_ctm, mock_conn):
+        mock_ctm.return_value = (None, None)
+        self.helper = MagicMock()
+        self.sandbox = SandboxWithSnapshotSupport(
+            namespace="test-ns", k8s_helper=self.helper,
+            claim_name="test-claim", sandbox_id="test-id",
+        )
+        self.triggers = MagicMock()
+        self.sandbox._snapshots = self.triggers
+
+    def test_default_cleans_triggers_then_deletes_claim_only(self):
+        self.sandbox.terminate()
+        self.triggers.delete_manual_triggers.assert_called_once_with()
+        self.helper.delete_sandbox_claim.assert_called_once_with("test-claim", "test-ns")
+        self.helper.delete_sandbox_claim_and_wait.assert_not_called()
+        self.assertIsNone(self.sandbox.snapshots)
+
+    def test_forwards_wait_options_after_trigger_cleanup(self):
+        order = MagicMock()
+        order.attach_mock(self.triggers.delete_manual_triggers, "triggers")
+        order.attach_mock(self.helper.delete_sandbox_claim_and_wait, "wait")
+        self.sandbox.terminate(wait=True, timeout=9)
+        self.assertEqual([c[0] for c in order.mock_calls], ["triggers", "wait"])
+        args = self.helper.delete_sandbox_claim_and_wait.call_args.args
+        self.assertEqual(args[:3], ("test-claim", "test-ns", 9.0))
+
+    def test_invalid_timeout_is_rejected_before_trigger_cleanup(self):
+        with self.assertRaises(ValueError):
+            self.sandbox.terminate(wait=True, timeout=0)
+        self.triggers.delete_manual_triggers.assert_not_called()
+        self.helper.delete_sandbox_claim_and_wait.assert_not_called()
+        self.assertIs(self.sandbox.snapshots, self.triggers)
+        self.assertTrue(self.sandbox.is_active)

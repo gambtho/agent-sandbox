@@ -24,6 +24,7 @@ from k8s_agent_sandbox.constants import (
     SANDBOX_API_VERSION,
     SANDBOX_PLURAL_NAME,
 )
+from k8s_agent_sandbox.deletion_wait import validate_wait_timeout
 from k8s_agent_sandbox.exceptions import SnapshotNotFoundError
 from k8s_agent_sandbox.metrics import (
     sandbox_client_resume_latency_ms,
@@ -577,13 +578,19 @@ class SandboxWithSnapshotSupport(Sandbox):
                 error_code=ERROR_CODE,
             )
 
-    def terminate(self) -> None:
+    def terminate(self, *, wait: bool = False, timeout: float = 180) -> None:
         """
         Cleans up the manually generated trigger resources and terminates the Sandbox.
+
+        Trigger cleanup runs first and is not counted against ``timeout``. See
+        ``Sandbox.terminate`` for ``wait`` and ``timeout``.
         """
+        if wait:
+            # Reject a bad timeout before the trigger cleanup, which is a side effect.
+            timeout = validate_wait_timeout(timeout)
         try:
             if self._snapshots:
                 self._snapshots.delete_manual_triggers()
         finally:
-            super().terminate()
+            super().terminate(wait=wait, timeout=timeout)
             self._snapshots = None

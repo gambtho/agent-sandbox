@@ -870,6 +870,31 @@ seconds, 180 by default. `AsyncSandbox` provides the same methods with `await`.
 For snapshot-backed suspension on GKE, use the
 [GKE snapshot extension](https://github.com/kubernetes-sigs/agent-sandbox/blob/main/clients/python/agentic-sandbox-client/k8s_agent_sandbox/gke_extensions/snapshots/README.md).
 
+## Waiting for deletion
+
+`terminate()` requests deletion and returns. To wait until the Kubernetes
+objects are gone, pass `wait=True`:
+
+```python
+sandbox.terminate(wait=True, timeout=120)
+```
+
+The claim is deleted with foreground propagation. The call returns when the
+claim, the Sandbox for this handle and that Sandbox's Pods are all absent in one
+polling pass. `timeout` is a finite number of seconds above 0, 180 by default,
+and covers the whole wait. When it expires the call raises `TimeoutError` naming
+what was still present or could not be checked. The budget can expire during
+reads before deletion is requested. Any deletion already in progress is left
+alone, and the handle keeps what it found so `terminate(wait=True)` can retry. A later plain `terminate()` only requests the delete again.
+`AsyncSandbox` provides the same option with `await`, and the GKE snapshot
+subclass forwards it after its trigger cleanup, which is not counted in `timeout`.
+
+The wait needs `get` permission on SandboxClaims, Sandboxes and Pods. It covers
+only objects known to the handle when it looks. It does not cover ones a
+controller creates later, and a Pod that is gone from the API does not prove its
+processes stopped on a node that cannot be reached. The Go SDK has no such
+option yet.
+
 ## Testing
 
 A test script is included to verify the full lifecycle (Creation -> Execution -> File I/O -> Cleanup).

@@ -35,6 +35,8 @@ from .constants import (
     CREATED_BY_LABEL,
     TERMINAL_CLAIM_READY_REASONS,
 )
+from .deletion_wait import DeadlineExceeded, PendingDeletion
+from . import deletion_wait
 from .models import AdditionalPodMetadata
 from .exceptions import SandboxClaimFailedError, SandboxMetadataError, SandboxNotFoundError, SandboxTemplateNotFoundError, SandboxWarmPoolNotFoundError
 from .utils import (
@@ -443,6 +445,84 @@ class AsyncK8sHelper:
             if e.status != 404:
                 logger.error(f"Error terminating SandboxClaim {name}: {e}")
                 raise
+
+    async def delete_sandbox_claim_and_wait(
+        self, name: str, namespace: str, timeout: float, pending: PendingDeletion,
+    ) -> None:
+        """Foreground-delete a SandboxClaim, then poll until the claim and every Sandbox and Pod
+        name in ``pending`` are absent in one pass.
+
+        Requests use the existing client with the remaining budget as their timeout, and the
+        whole wait runs under one ``asyncio.timeout``. ``pending`` gains every name learned along
+        the way; keep it for a retry. Raises ``TimeoutError`` when the budget runs out and lets
+        non-404 API errors propagate. Reading needs ``get`` on SandboxClaims, Sandboxes and Pods.
+        """
+        await self._ensure_initialized()
+        deadline = time.monotonic() + timeout
+        present: list[str] = []
+        unverified: str | None = None
+        delete_sent = False
+
+        async def call(label: str, func: Any, *, deleting: bool = False, **kwargs: Any) -> Any:
+            nonlocal unverified, delete_sent
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeadlineExceeded()
+            unverified = label
+            if deleting:
+                delete_sent = True
+            try:
+                result = await func(_request_timeout=remaining, **kwargs)
+            except client.ApiException as e:
+                if e.status != 404:
+                    raise
+                result = None
+            unverified = None
+            return result
+
+        async def observe() -> list[str]:
+            found: list[str] = []
+            label = f"SandboxClaim '{pending.claim_name}'"
+            claim = await call(label, self.custom_objects_api.get_namespaced_custom_object,
+                               group=CLAIM_API_GROUP, version=CLAIM_API_VERSION, namespace=namespace,
+                               plural=CLAIM_PLURAL_NAME, name=pending.claim_name)
+            if claim is not None:
+                found.append(label)
+                pending.learn_claim(claim)
+            for sandbox_name in sorted(pending.sandboxes):
+                label = f"Sandbox '{sandbox_name}'"
+                sandbox = await call(label, self.custom_objects_api.get_namespaced_custom_object,
+                                     group=SANDBOX_API_GROUP, version=SANDBOX_API_VERSION,
+                                     namespace=namespace, plural=SANDBOX_PLURAL_NAME, name=sandbox_name)
+                if sandbox is not None:
+                    found.append(label)
+                    pending.learn_sandbox(sandbox_name, sandbox)
+            for pod_name in sorted(pending.pods):
+                label = f"Pod '{pod_name}'"
+                if await call(label, self.core_v1_api.read_namespaced_pod,
+                              name=pod_name, namespace=namespace) is not None:
+                    found.append(label)
+            return found
+
+        try:
+            async with asyncio.timeout(timeout):
+                # Learn names while the claim and Sandbox still exist, before deleting anything.
+                present = await observe()
+                await call(f"deletion of SandboxClaim '{name}'",
+                           self.custom_objects_api.delete_namespaced_custom_object,
+                           deleting=True, group=CLAIM_API_GROUP, version=CLAIM_API_VERSION, namespace=namespace,
+                           plural=CLAIM_PLURAL_NAME, name=name, propagation_policy="Foreground")
+                logger.info(f"Requested foreground deletion of SandboxClaim: {name}")
+                while True:
+                    present = await observe()
+                    if not present:
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise DeadlineExceeded()
+                    await asyncio.sleep(min(deletion_wait.POLL_INTERVAL_SECONDS, remaining))
+        except (TimeoutError, DeadlineExceeded):
+            raise pending.timeout_error(timeout, present, unverified, delete_sent) from None
 
     async def patch_sandbox_operating_mode(
         self, name: str, namespace: str, mode: str, uid: str,
